@@ -1,0 +1,26 @@
+# Raw datasets and large local inputs
+data_raw/
+
+# Logs and temporary runtime outputs
+logs/
+*.log
+*.tmp
+*.bak
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Spark / Hive local runtime files
+spark-warehouse/
+metastore_db/
+derby.log
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
