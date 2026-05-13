@@ -355,55 +355,239 @@ def split_train_test(cleaned: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     return train, test
 
 
-def build_rule_boosts(rules: pd.DataFrame) -> dict[str, float]:
-    boosts: dict[str, float] = defaultdict(float)
+def normalize_mapping(values: dict[object, float]) -> dict[object, float]:
+    if not values:
+        return {}
+    clean_values = {key: max(float(value), 0.0) for key, value in values.items()}
+    max_value = max(clean_values.values())
+    if max_value <= 0:
+        return {key: 0.0 for key in clean_values}
+    return {key: value / max_value for key, value in clean_values.items()}
+
+
+def split_tags(tag_string: object) -> list[str]:
+    return [tag.strip() for tag in str(tag_string).split("|") if tag.strip() and tag.strip() != "nan"]
+
+
+def build_rule_boosts(rules: pd.DataFrame) -> dict[str, dict[object, float]]:
+    features: dict[str, dict[object, float]] = {
+        "theme_rule_quality": defaultdict(float),
+        "tag_rule_quality": defaultdict(float),
+        "group_theme_rule_quality": defaultdict(float),
+        "theme_hate_risk": defaultdict(float),
+    }
     if rules.empty:
-        return boosts
-    positive_behaviors = {"behavior=effective_view", "behavior=like", "behavior=collect", "behavior=comment", "behavior=forward"}
+        return {key: {} for key in features}
+
+    behavior_weights = {
+        "behavior=effective_view": 0.45,
+        "behavior=like": 1.00,
+        "behavior=collect": 1.20,
+        "behavior=comment": 0.80,
+        "behavior=forward": 1.10,
+        "behavior=hate": -1.00,
+    }
     for row in rules.itertuples(index=False):
-        if row.consequent not in positive_behaviors:
+        consequent = str(row.consequent)
+        if consequent not in behavior_weights:
             continue
-        for part in str(row.antecedent).split(" & "):
-            if part.startswith("theme="):
-                theme = part.split("=", 1)[1]
-                boosts[theme] += float(row.confidence) * max(float(row.lift), 0)
-    if boosts:
-        max_boost = max(boosts.values())
-        boosts = {theme: value / max_boost for theme, value in boosts.items()}
-    return boosts
+        if int(row.support_count) < 20 or float(row.lift) <= 1.02:
+            continue
+        parts = [part.strip() for part in str(row.antecedent).split(" & ")]
+        score = abs(behavior_weights[consequent]) * float(row.confidence) * np.log1p(float(row.support_count)) * np.log(float(row.lift))
+        themes = [int(part.split("=", 1)[1]) for part in parts if part.startswith("theme=")]
+        tags = [part.split("=", 1)[1] for part in parts if part.startswith("tag=")]
+        groups = [part for part in parts if part.startswith(("gender=", "age_group=", "city_level="))]
+
+        if consequent == "behavior=hate":
+            for theme in themes:
+                features["theme_hate_risk"][theme] += score
+            continue
+
+        for theme in themes:
+            features["theme_rule_quality"][theme] += score
+            for group in groups:
+                dimension, value = group.split("=", 1)
+                features["group_theme_rule_quality"][(dimension, value, theme)] += score
+        for tag in tags:
+            features["tag_rule_quality"][tag] += score
+
+    return {key: normalize_mapping(dict(value)) for key, value in features.items()}
 
 
-def recommend(cleaned: pd.DataFrame, preference: pd.DataFrame, rules: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    train, test = split_train_test(cleaned)
-    catalog = cleaned.drop_duplicates("pid")[["pid", "root_id", "root_name_cn", "title", "duration", "author_fans_count"]]
+def build_group_theme_success(train: pd.DataFrame) -> dict[tuple[str, str, int], float]:
+    global_success = (
+        train.groupby("root_id")
+        .agg(
+            exposure_count=("pid", "size"),
+            avg_interaction_score=("interaction_score", "mean"),
+            effective_view_rate=("effective_view", "mean"),
+            like_rate=("cvm_like", "mean"),
+            collect_rate=("collect", "mean"),
+            forward_rate=("forward", "mean"),
+            hate_rate=("hate", "mean"),
+        )
+        .reset_index()
+    )
+    global_success["success"] = (
+        0.40 * global_success["avg_interaction_score"]
+        + 0.25 * global_success["effective_view_rate"]
+        + 0.12 * global_success["like_rate"]
+        + 0.15 * global_success["collect_rate"]
+        + 0.12 * global_success["forward_rate"]
+        - 0.20 * global_success["hate_rate"]
+    ).clip(lower=0)
+    global_map = dict(zip(global_success["root_id"], global_success["success"]))
+
+    result: dict[tuple[str, str, int], float] = {}
+    alpha = 50
+    for dimension in ["gender", "age_group", "fre_city_level"]:
+        grouped = (
+            train.groupby([dimension, "root_id"], dropna=False)
+            .agg(
+                exposure_count=("pid", "size"),
+                avg_interaction_score=("interaction_score", "mean"),
+                effective_view_rate=("effective_view", "mean"),
+                like_rate=("cvm_like", "mean"),
+                collect_rate=("collect", "mean"),
+                forward_rate=("forward", "mean"),
+                hate_rate=("hate", "mean"),
+            )
+            .reset_index()
+        )
+        grouped["raw_success"] = (
+            0.40 * grouped["avg_interaction_score"]
+            + 0.25 * grouped["effective_view_rate"]
+            + 0.12 * grouped["like_rate"]
+            + 0.15 * grouped["collect_rate"]
+            + 0.12 * grouped["forward_rate"]
+            - 0.20 * grouped["hate_rate"]
+        ).clip(lower=0)
+        for row in grouped.itertuples(index=False):
+            root_id = int(row.root_id)
+            prior = global_map.get(root_id, 0.0)
+            smoothed = (row.exposure_count * row.raw_success + alpha * prior) / (row.exposure_count + alpha)
+            result[(dimension, str(getattr(row, dimension)), root_id)] = smoothed
+
+    return normalize_mapping(result)
+
+
+def build_theme_similarity(preference: pd.DataFrame) -> dict[tuple[int, int], float]:
+    theme_counts: Counter[int] = Counter()
+    pair_counts: Counter[tuple[int, int]] = Counter()
+    for _, group in preference.sort_values("preference_score", ascending=False).groupby("user_id"):
+        top_themes = [int(theme) for theme in group.head(5)["root_id"].tolist()]
+        for theme in top_themes:
+            theme_counts[theme] += 1
+        for left, right in combinations(sorted(set(top_themes)), 2):
+            pair_counts[(left, right)] += 1
+
+    similarity: dict[tuple[int, int], float] = {}
+    for (left, right), count in pair_counts.items():
+        denom = np.sqrt(theme_counts[left] * theme_counts[right])
+        if denom > 0:
+            value = count / denom
+            similarity[(left, right)] = value
+            similarity[(right, left)] = value
+    return similarity
+
+
+def build_user_positive_tags(train: pd.DataFrame) -> dict[int, set[str]]:
+    positive = train[(train["effective_view"] | train["cvm_like"] | train["collect"] | train["comment"] | train["forward"]) & (~train["hate"])]
+    tags: dict[int, set[str]] = defaultdict(set)
+    for row in positive[["user_id", "tag_name"]].itertuples(index=False):
+        tags[int(row.user_id)].update(split_tags(row.tag_name))
+    return tags
+
+
+def recommend(train: pd.DataFrame, test: pd.DataFrame, preference: pd.DataFrame, rules: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    catalog = train.drop_duplicates("pid")[["pid", "root_id", "root_name_cn", "title", "duration", "author_fans_count", "tag_name"]]
     popularity = (
         train.groupby("pid")
         .agg(popularity_score=("interaction_score", "sum"), train_exposure=("pid", "size"))
         .reset_index()
     )
     catalog = catalog.merge(popularity, on="pid", how="left").fillna({"popularity_score": 0, "train_exposure": 0})
+    catalog["item_popularity_score"] = np.log1p(catalog["popularity_score"])
+    max_item_popularity = catalog["item_popularity_score"].max() or 1
+    catalog["item_popularity_score"] = catalog["item_popularity_score"] / max_item_popularity
+
     seen = train.groupby("user_id")["pid"].apply(set).to_dict()
     user_preferences = preference.groupby("user_id")
-    rule_boosts = build_rule_boosts(rules)
+    rule_features = build_rule_boosts(rules)
+    group_theme_success = build_group_theme_success(train)
+    theme_similarity = build_theme_similarity(preference)
+    user_positive_tags = build_user_positive_tags(train)
+    user_hate = train.groupby(["user_id", "root_id"])["hate"].mean().to_dict()
 
     baseline_rows = []
     enhanced_rows = []
-    for user_id in sorted(cleaned["user_id"].unique()):
+    for user_id in sorted(train["user_id"].unique()):
         if user_id in user_preferences.groups:
             pref = user_preferences.get_group(user_id)[["root_id", "preference_score"]].copy()
+            max_pref = pref["preference_score"].max() or 1
+            pref["personal_theme_score"] = pref["preference_score"] / max_pref
+            pref_map = dict(zip(pref["root_id"].astype(int), pref["personal_theme_score"]))
         else:
-            pref = pd.DataFrame(columns=["root_id", "preference_score"])
+            pref = pd.DataFrame(columns=["root_id", "personal_theme_score"])
+            pref_map = {}
+
         candidates = catalog[~catalog["pid"].isin(seen.get(user_id, set()))].copy()
         if candidates.empty:
             continue
-        candidates = candidates.merge(pref, on="root_id", how="left").fillna({"preference_score": 0})
-        max_pop = candidates["popularity_score"].max() or 1
-        candidates["baseline_score"] = candidates["preference_score"] + 0.15 * candidates["popularity_score"] / max_pop
-        candidates["rule_boost"] = candidates["root_id"].astype(str).map(rule_boosts).fillna(0)
-        candidates["enhanced_score"] = candidates["baseline_score"] * (1 + 0.25 * candidates["rule_boost"])
+        candidates = candidates.merge(pref[["root_id", "personal_theme_score"]], on="root_id", how="left").fillna({"personal_theme_score": 0})
 
-        base_top = candidates.sort_values(["baseline_score", "popularity_score"], ascending=False).head(TOP_K)
-        enhanced_top = candidates.sort_values(["enhanced_score", "popularity_score"], ascending=False).head(TOP_K)
+        user_row = train[train["user_id"] == user_id].iloc[-1]
+        gender = str(user_row.gender)
+        age_group = str(user_row.age_group)
+        city_level = str(user_row.fre_city_level)
+        positive_tags = user_positive_tags.get(int(user_id), set())
+
+        def score_group_theme(root_id: int) -> float:
+            return (
+                0.40 * group_theme_success.get(("gender", gender, root_id), 0)
+                + 0.35 * group_theme_success.get(("age_group", age_group, root_id), 0)
+                + 0.25 * group_theme_success.get(("fre_city_level", city_level, root_id), 0)
+            )
+
+        def score_similarity(root_id: int) -> float:
+            if not pref_map:
+                return 0.0
+            return min(sum(score * theme_similarity.get((int(theme), root_id), 0) for theme, score in pref_map.items()), 1.0)
+
+        def score_tag_match(tag_name: object) -> float:
+            candidate_tags = set(split_tags(tag_name))
+            if not candidate_tags or not positive_tags:
+                return 0.0
+            return min(sum(rule_features["tag_rule_quality"].get(tag, 0) for tag in candidate_tags & positive_tags), 1.0)
+
+        candidates["group_theme_success"] = candidates["root_id"].astype(int).map(score_group_theme)
+        candidates["theme_rule_quality"] = candidates["root_id"].astype(int).map(rule_features["theme_rule_quality"]).fillna(0)
+        candidates["similar_theme_score"] = candidates["root_id"].astype(int).map(score_similarity)
+        candidates["tag_match_score"] = candidates["tag_name"].map(score_tag_match)
+        candidates["theme_hate_risk"] = candidates["root_id"].astype(int).map(rule_features["theme_hate_risk"]).fillna(0)
+        candidates["user_hate_risk"] = candidates["root_id"].astype(int).map(lambda root_id: user_hate.get((user_id, root_id), 0))
+        candidates["hate_risk_penalty"] = 0.55 * candidates["user_hate_risk"] + 0.45 * candidates["theme_hate_risk"]
+
+        candidates["baseline_score"] = 0.82 * candidates["personal_theme_score"] + 0.18 * candidates["item_popularity_score"]
+        candidates["rule_boost"] = (
+            0.35 * candidates["group_theme_success"]
+            + 0.30 * candidates["theme_rule_quality"]
+            + 0.20 * candidates["similar_theme_score"]
+            + 0.15 * candidates["tag_match_score"]
+        )
+        candidates["enhanced_score"] = (
+            0.58 * candidates["baseline_score"]
+            + 0.16 * candidates["group_theme_success"]
+            + 0.11 * candidates["theme_rule_quality"]
+            + 0.08 * candidates["similar_theme_score"]
+            + 0.09 * candidates["item_popularity_score"]
+            + 0.05 * candidates["tag_match_score"]
+            - 0.07 * candidates["hate_risk_penalty"]
+        )
+
+        base_top = candidates.sort_values(["baseline_score", "item_popularity_score"], ascending=False).head(TOP_K)
+        enhanced_top = candidates.sort_values(["enhanced_score", "item_popularity_score"], ascending=False).head(TOP_K)
         for rank, row in enumerate(base_top.itertuples(index=False), start=1):
             baseline_rows.append(
                 {
@@ -434,39 +618,38 @@ def recommend(cleaned: pd.DataFrame, preference: pd.DataFrame, rules: pd.DataFra
     enhanced = pd.DataFrame(enhanced_rows)
     baseline.to_csv(REC_DIR / "baseline_recommendations.csv", index=False)
     enhanced.to_csv(REC_DIR / "rule_enhanced_recommendations.csv", index=False)
-    evaluation = evaluate_recommendations(test, preference, baseline, enhanced)
+    evaluation = evaluate_recommendations(test, baseline, enhanced)
     evaluation.to_csv(TABLE_DIR / "evaluation_summary.csv", index=False)
     return baseline, enhanced, evaluation
 
 
-def evaluate_recommendations(test: pd.DataFrame, preference: pd.DataFrame, baseline: pd.DataFrame, enhanced: pd.DataFrame) -> pd.DataFrame:
+def evaluate_recommendations(test: pd.DataFrame, baseline: pd.DataFrame, enhanced: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    high_pref_theme = preference.sort_values("preference_score", ascending=False).groupby("user_id")["root_id"].apply(lambda s: set(s.head(3))).to_dict()
-    test_items = test.groupby("user_id")["pid"].apply(set).to_dict() if not test.empty else {}
-    test_themes = test.groupby("user_id")["root_id"].apply(set).to_dict() if not test.empty else {}
+    positive_test = test[(test["effective_view"] | test["cvm_like"] | test["collect"] | test["comment"] | test["forward"]) & (~test["hate"])]
+    test_items = positive_test.groupby("user_id")["pid"].apply(set).to_dict() if not positive_test.empty else {}
+    test_themes = positive_test.groupby("user_id")["root_id"].apply(set).to_dict() if not positive_test.empty else {}
 
     for name, recs in [("baseline", baseline), ("rule_enhanced", enhanced)]:
         hit_values = []
         precision_values = []
         recall_values = []
         theme_match_values = []
-        for user_id, group in recs.groupby("user_id"):
+        for user_id, true_items in test_items.items():
+            group = recs[recs["user_id"] == user_id]
+            if group.empty:
+                continue
             recommended_items = set(group["pid"])
             recommended_themes = set(group["root_id"])
-            true_items = test_items.get(user_id, set())
             true_themes = test_themes.get(user_id, set())
-            preferred_themes = high_pref_theme.get(user_id, set())
-            if true_items:
-                hits = recommended_items & true_items
-                hit_values.append(1.0 if hits else 0.0)
-                precision_values.append(len(hits) / max(len(recommended_items), 1))
-                recall_values.append(len(hits) / len(true_items))
-            if preferred_themes:
-                theme_match_values.append(len(recommended_themes & (preferred_themes | true_themes)) / max(len(recommended_themes), 1))
+            hits = recommended_items & true_items
+            hit_values.append(1.0 if hits else 0.0)
+            precision_values.append(len(hits) / max(len(recommended_items), 1))
+            recall_values.append(len(hits) / len(true_items))
+            theme_match_values.append(len(recommended_themes & true_themes) / max(len(recommended_themes), 1))
         rows.append(
             {
                 "method": name,
-                "user_count": recs["user_id"].nunique() if not recs.empty else 0,
+                "user_count": len(test_items),
                 "HitRate@10": np.mean(hit_values) if hit_values else 0,
                 "Precision@10": np.mean(precision_values) if precision_values else 0,
                 "Recall@10": np.mean(recall_values) if recall_values else 0,
@@ -545,15 +728,18 @@ def main() -> None:
     ensure_dirs()
     cleaned = clean_interactions()
     save_clean_outputs(cleaned)
-    theme_summary = summarize_theme_behavior(cleaned)
-    group_summary = summarize_user_groups(cleaned)
-    preference = build_user_theme_preference(cleaned)
-    rules = mine_rules(cleaned)
-    _, _, evaluation = recommend(cleaned, preference, rules)
+    train, test = split_train_test(cleaned)
+    theme_summary = summarize_theme_behavior(train)
+    group_summary = summarize_user_groups(train)
+    preference = build_user_theme_preference(train)
+    rules = mine_rules(train)
+    _, _, evaluation = recommend(train, test, preference, rules)
     plot_outputs(theme_summary, group_summary, evaluation)
 
     print("Local pipeline finished")
     print(f"clean_interactions={len(cleaned):,}")
+    print(f"train_interactions={len(train):,}")
+    print(f"test_interactions={len(test):,}")
     print(f"themes={theme_summary['root_id'].nunique():,}")
     print(f"rules={len(rules):,}")
     print(evaluation.to_string(index=False))
