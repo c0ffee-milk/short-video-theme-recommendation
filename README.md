@@ -1,6 +1,5 @@
 # 短视频主题偏好分析与推荐策略优化
 
-> “大数据处理”课程期末项目  
 > 基于 Tsinghua ShortVideo Dataset 抽样数据的主题偏好分析、关联规则挖掘与推荐策略优化
 
 ## 项目概览
@@ -9,24 +8,17 @@
 
 项目以 `Tsinghua ShortVideo Dataset` 的小规模抽样数据为基础，完成了从原始交互清洗、用户-视频聚合、训练测试切分、主题行为统计、用户-主题偏好画像、关联规则挖掘，到 `baseline` 与 `rule-enhanced` 推荐方案离线对比评估的完整流程。
 
-## 课程项目信息
-
-- 课程名称：大数据处理
-- 项目主题：短视频主题偏好分析、关联规则挖掘与推荐策略优化
-- 项目成员：梁珂、方家烨、李俊婕、刘翔
-- 项目报告：[课程报告 PDF](report/final_report/short_video_theme_recommendation_report.pdf)
-
 ## 项目亮点
 
 - 构建了用户-视频级交互表，解决一次曝光对应多标签导致的重复统计问题。
 - 将观看比例、有效观看、互动反馈与负反馈统一映射为可解释的主题偏好得分。
 - 在训练集上同时学习个体偏好与群体规则，测试集只用于离线评估，避免信息泄漏。
 - 保留了本地 Python、Spark 与 Hive 三套实现路径，兼顾课程展示与大数据处理工具链要求。
-- 输出完整实验产物，包括统计表、规则表、推荐清单、图表与课程报告。
+- 输出完整实验产物，包括统计表、规则表、推荐清单与图表。
 
 ## 实验流程
 
-下图展示了课程项目的完整实验流程。训练集用于画像与规则学习，测试集只用于离线评估。
+下图展示了项目的整体实验流程。训练集用于画像与规则学习，测试集只用于离线评估。
 
 ![项目整体实验流程](output/figures/method_pipeline_overview.png)
 
@@ -53,13 +45,11 @@
 │   ├── rules/                      # 关联规则结果
 │   ├── recommendations/            # 推荐结果
 │   └── figures/                    # 可视化图表
-└── report/
-    └── final_report/               # 课程最终报告 PDF 与 LaTeX 源码
 ```
 
 ## 数据说明
 
-原始数据来自 `Tsinghua ShortVideo Dataset`。由于完整视频与行为数据体量较大，本仓库只保留课程项目复现实验所需的轻量输入与输出，不上传原始视频文件和原始大表。
+原始数据来自 `Tsinghua ShortVideo Dataset`。由于完整视频与行为数据体量较大，本仓库只保留复现实验所需的轻量输入与输出，不上传原始视频文件和原始大表。
 
 仓库中保留：
 
@@ -68,7 +58,7 @@
 - 用户-主题偏好画像
 - 关联规则结果
 - 推荐结果与评估结果
-- 可视化图表与课程报告
+- 可视化图表
 
 如需重新运行本地流水线，请自行准备原始抽样数据，并放到：
 
@@ -191,7 +181,6 @@ hive/shortvideo_analysis.sql
 - `output/recommendations/baseline_recommendations.csv`：基础推荐结果
 - `output/recommendations/rule_enhanced_recommendations.csv`：规则增强推荐结果
 - `output/tables/evaluation_summary.csv`：离线评估结果
-- `report/final_report/short_video_theme_recommendation_report.pdf`：课程最终报告
 
 ## 说明
 

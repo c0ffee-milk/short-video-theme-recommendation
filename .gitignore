@@ -27,6 +27,7 @@ derby.log
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+report/final_report/
 
 # Local agent handoff and drafting artifacts
 HANDOFF.md
