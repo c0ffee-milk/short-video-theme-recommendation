@@ -20,6 +20,20 @@ spark-warehouse/
 metastore_db/
 derby.log
 
+# LaTeX auxiliary files
+*.aux
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Local agent handoff and drafting artifacts
+HANDOFF.md
+plan/
+garden-gpt-image-2/
+scripts/draw_method_pipeline_cvpr.py
+
 # OS and editor files
 .DS_Store
 .idea/
